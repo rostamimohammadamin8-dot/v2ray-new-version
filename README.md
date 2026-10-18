@@ -4,9 +4,9 @@
 
 این مخزن، راهنمای استقرار یک تجمیع‌کننده چندمنبعی اشتراک و کلاینت قابل‌حمل v2rayN است.
 
-> **Repository status / وضعیت مخزن:** The documented aggregation pipeline is implemented in this repository: `scripts/aggregate.py`, `config/sources.json`, the GitHub Actions workflow, and a stdlib test suite are present. The configured upstream source currently returns HTTP 404, so no generated feeds are committed yet; a failed run never replaces existing output. The v2rayN application source/build output is **not** included here.
+> **Repository status / وضعیت مخزن:** The production pipeline is implemented: strict per-protocol parsers (`scripts/proxy_uri.py`), transactional aggregation (`scripts/aggregate.py`), async TCP/TLS health probes (`scripts/health.py`), SHA256/atomic integrity (`scripts/integrity.py`), an optional sanitized 9Router client (`scripts/ai_ops.py`), an offline verifier, 163 stdlib tests, and CI/CD. The configured upstream source currently returns HTTP 404, so no generated feeds are committed yet; a failed run never replaces existing output. The v2rayN application source/build output is **not** included here.
 >
-> **وضعیت مخزن:** خط لوله تجمیع شرح‌داده‌شده در این مخزن پیاده‌سازی شده است: `scripts/aggregate.py`، `config/sources.json`، گردش‌کار GitHub Actions و مجموعه آزمون مبتنی بر کتابخانه استاندارد موجود هستند. منبع بالادستی پیکربندی‌شده در حال حاضر HTTP 404 برمی‌گرداند، بنابراین هنوز فید تولیدشده‌ای commit نشده است؛ اجرای ناموفق هرگز خروجی قبلی را جایگزین نمی‌کند. کد/خروجی ساخت v2rayN در این مخزن وجود ندارد.
+> **وضعیت مخزن:** خط لوله تولیدی پیاده‌سازی شده است: پارسرهای سخت‌گیرانۀ هر پروتکل (`scripts/proxy_uri.py`)، تجمیع تراکنشی (`scripts/aggregate.py`)، بررسی سلامت ناهمگام TCP/TLS (`scripts/health.py`)، یکپارچگی SHA256 و انتشار اتمی (`scripts/integrity.py`)، کلاینت اختیاری و پاک‌سازی‌شدۀ 9Router (`scripts/ai_ops.py`)، ابزار اعتبارسنجی آفلاین، ۱۶۳ آزمون استاندارد و CI/CD. منبع بالادستی فعلاً HTTP 404 برمی‌گرداند، بنابراین فید تولیدشده commit نشده است؛ اجرای ناموفق هرگز خروجی قبلی را جایگزین نمی‌کند. کد/خروجی ساخت v2rayN در این مخزن نیست.
 
 ## Contents
 
@@ -32,30 +32,34 @@ https://raw.githubusercontent.com/luke-wilsonio96i3/Free-VPN-Config-Pack-2026/ma
 
 Only add other upstreams after reviewing and explicitly configuring them. Do not assume that a public feed is stable, safe, or operated by this project.
 
-### Target repository layout
+### Repository layout
 
-The aggregation files below are implemented; `data/` appears only after a successful run. The v2rayN application source/build output remains outside this repository.
+The pipeline below is implemented; `data/` appears only after a successful,
+verified run. The v2rayN application source/build output remains outside this
+repository. `ci/update-subscriptions.yml` is the workflow template because the
+automation integration cannot push under `.github/workflows/` without the
+GitHub `workflows` permission.
 
 ```text
 .
-├── .github/
-│   └── workflows/
-│       └── update-subscriptions.yml
-├── config/
-│   └── sources.json
-├── data/
+├── .github/workflows/update-subscriptions.yml   # copy of ci/ template when permitted
+├── ci/update-subscriptions.yml
+├── config/sources.json
+├── data/                                        # generated, checksummed, not yet committed
 │   ├── manifest.json
-│   └── subscriptions/
-│       ├── global.txt
-│       ├── de.txt
-│       ├── us.txt
-│       ├── nl.txt
-│       ├── tr.txt
-│       ├── fr.txt
-│       ├── uk.txt
-│       └── ca.txt
+│   ├── SHA256SUMS
+│   ├── health.json                              # optional health sidecar
+│   ├── snapshot/global.txt
+│   └── subscriptions/{global,de,us,nl,tr,fr,uk,ca}.txt
+├── docs/ARCHITECTURE.md
 ├── scripts/
-│   └── aggregate.py
+│   ├── aggregate.py
+│   ├── ai_ops.py
+│   ├── health.py
+│   ├── integrity.py
+│   ├── proxy_uri.py
+│   └── verify.py
+├── tests/
 └── README.md
 ```
 
@@ -63,15 +67,17 @@ Keep generated subscriptions separate from source configuration. The workflow sh
 
 ### Aggregation behavior
 
-The Python 3.12 aggregator should:
+The Python 3.12 aggregator implements:
 
-1. Read an explicit source list, starting with the URL above. Fetch sources over HTTPS with bounded timeouts and response-size limits.
-2. Decode a source as strict UTF-8, then recognize either newline-separated proxy URIs or a Base64-encoded subscription payload. Reject malformed input rather than silently emitting a partial result.
-3. Validate supported URI schemes, normalize line endings, remove blank/comment lines, and deduplicate identical node URIs while preserving useful names.
-4. Assign a best-effort country label using available node remarks and hostname hints. Support `DE`, `US`, `NL`, `TR`, `FR`, `UK`, `CA`, and `GLOBAL`; use `GLOBAL` for unknown or unclassified nodes. Country assignment is heuristic, not verified geolocation.
-5. Optionally test the endpoint's TCP connection with a short timeout. A TCP connection only says that a port accepted a connection at that moment; it does not validate a V2Ray handshake, authentication, TLS, routing, or end-to-end proxy traffic.
-6. Write `global.txt` and country-specific text feeds in the URI format accepted by v2rayN. Write to temporary files first and replace final outputs only after the entire run succeeds. Keep a last-known-good snapshot for client-side offline use.
-7. Produce a manifest for observability and QA. Do not put secrets or credentials in it.
+1. An explicit source list; HTTPS-only fetch with bounded time/size, redirect-downgrade rejection, and bounded retries for transient failures.
+2. Strict UTF-8 decoding plus either newline-separated proxy URIs or a Base64 subscription payload. Malformed input rejects the whole source.
+3. Per-protocol structural validation (`VLESS`, `VMess`, `Trojan`, `Shadowsocks`, `Hysteria`, `Hysteria2`, `TUIC`, SOCKS/HTTP/SSH/WireGuard), credential sanity checks, UUID/port/host validation, and warning flags for plaintext/TLS downgrade/insecure/weak-cipher cases.
+4. Country labels from remarks, flags, cities, and hostname hints (`DE`, `US`, `NL`, `TR`, `FR`, `UK`, `CA`, `GLOBAL`) with a confidence score. Labels are heuristic, not geolocation.
+5. Optional asynchronous TCP/TLS probes with latency, TLS-handshake status, error classes, and a 0-100 advisory score. TCP/TLS reachability is not proof of a working proxy tunnel, authentication, location, or trust.
+6. Transactional publication: feeds and country subsets, a last-known-good snapshot, a manifest, per-file SHA256 checksums, and `SHA256SUMS`. Everything is staged and verified before any file replaces production output.
+7. Optional sanitized telemetry and AI review/diagnosis through 9Router. The gateway is never a dependency and never receives URIs, credentials, or tokens.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module diagram, trust boundaries, failure matrix, and extension points.
 
 Example source configuration:
 
@@ -124,16 +130,25 @@ The implementation uses only the Python 3.12 standard library.
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/aggregate.py --config config/sources.json --output-dir data
+python3 scripts/verify.py --data-dir data
 ```
 
-Options: `--timeout` (per-request seconds, default 15), `--max-bytes` (per-source
-limit, default 5 MiB), `--tcp-check` (best-effort TCP probe), `--tcp-timeout`,
-`--require-reachable` (drop nodes that fail the probe), and `--verbose`.
+Core options: `--timeout` (per-request seconds, default 15), `--max-bytes`
+(per-source limit, default 5 MiB), `--retries` (transient retries, default 2),
+`--health-check` (async TCP+TLS probe and `health.json`), `--no-tls-probe`,
+`--verify-tls`, `--health-concurrency`, `--tcp-timeout`, `--require-reachable`
+(drop nodes that fail the probe), and `--verbose`.
+
+Optional intelligence: `--ai-review` requests a sanitized gateway review;
+`--ai-diagnose` requests a diagnosis when a run fails; `--ai-model`,
+`--ai-base-url`, `--ai-output`, and `--telemetry PATH` control the client. The
+gateway is never required and failures degrade to warnings.
 
 A successful run writes `data/subscriptions/*.txt`, `data/snapshot/global.txt`,
-and `data/manifest.json`. Files are staged first and published only after every
-enabled source was fetched and validated, so a failed run leaves the previous
-feeds and snapshot untouched. The process exits non-zero on any failure.
+`data/manifest.json`, `data/SHA256SUMS`, and optionally `data/health.json`.
+Everything is staged and verified before publication, so a failed run leaves the
+previous tree byte-identical. Exit codes: `0` success, `1` fetch/parse/integrity
+failure, `2` invalid usage/configuration.
 
 ### GitHub Actions deployment
 
@@ -143,13 +158,13 @@ GitHub web UI) to enable scheduled runs; automation integrations that lack the
 `workflows` permission cannot publish files under `.github/workflows/` directly.
 It is configured to:
 
-- Run on a modest schedule (for example, every six hours) and support `workflow_dispatch` for manual runs.
-- Use `actions/checkout`, set up **Python 3.12**, install only pinned/required dependencies, and run the aggregator with a non-zero exit code on failure.
-- Grant only the permissions it needs. If it commits generated feeds, limit write access to repository contents and commit only when outputs changed.
-- Avoid publishing partial results after a failed fetch/parse. Retain the previous known-good output if a run fails.
-- Keep logs free of subscription contents, credentials, and tokens. Review the generated diff before enabling unattended publication.
+- Run every six hours and support manual dispatch, with optional health/AI inputs.
+- Use pinned `actions/checkout` and `actions/setup-python`, Python 3.12, and no third-party Python packages.
+- Run the full test suite, aggregate, then run the offline verifier before uploading or committing.
+- Upload the verified feeds as an artifact, and commit only when `data/` changed.
+- Grant only `contents: write`, keep logs free of credentials, and never publish partial output after a failed fetch/parse.
 
-Scheduled workflows run from the repository's default branch. The scheduled job and published feed do not exist until their implementation and workflow are added.
+Scheduled workflows run from the repository's default branch.
 
 ### v2rayN integration and refresh
 
@@ -347,21 +362,23 @@ https://raw.githubusercontent.com/<OWNER>/<REPOSITORY>/<BRANCH>/data/subscriptio
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/aggregate.py --config config/sources.json --output-dir data
+python3 scripts/verify.py --data-dir data
 ```
 
-گزینه‌ها: `--timeout` (ثانیه برای هر درخواست، پیش‌فرض ۱۵)، `--max-bytes` (سقف هر منبع، پیش‌فرض ۵ MiB)، `--tcp-check` (بررسی ابتدایی TCP)، `--tcp-timeout`، `--require-reachable` (حذف گره‌های ناموفق در بررسی TCP) و `--verbose`.
+گزینه‌های اصلی: `--timeout` (ثانیه برای هر درخواست، پیش‌فرض ۱۵)، `--max-bytes` (سقف هر منبع، پیش‌فرض ۵ MiB)، `--retries` (تلاش مجدد برای خطاهای گذرا، پیش‌فرض ۲)، `--health-check` (بررسی ناهمگام TCP/TLS و تولید `health.json`)، `--no-tls-probe`، `--verify-tls`، `--health-concurrency`، `--tcp-timeout`، `--require-reachable` (حذف گره‌های ناموفق) و `--verbose`.
 
-اجرای موفق `data/subscriptions/*.txt`، `data/snapshot/global.txt` و `data/manifest.json` را می‌نویسد. ابتدا همه فایل‌ها در مسیر موقت ساخته می‌شوند و فقط پس از دریافت و اعتبارسنجی موفق همۀ منابع فعال، جایگزین خروجی نهایی می‌شوند؛ بنابراین اجرای ناموفق فیدها و snapshot قبلی را دست‌نخورده نگه می‌دارد و با کد غیرصفر خارج می‌شود.
+گزینه‌های هوشمند اختیاری: `--ai-review` برای مرور پاک‌سازی‌شدۀ درگاه، `--ai-diagnose` برای تشخیص خطا، و `--ai-model`، `--ai-base-url`، `--ai-output` و `--telemetry PATH`. درگاه هرگز الزامی نیست و خطای آن فقط هشدار می‌دهد.
+
+اجرای موفق `data/subscriptions/*.txt`، `data/snapshot/global.txt`، `data/manifest.json`، `data/SHA256SUMS` و در صورت فعال بودن `data/health.json` را می‌نویسد. همۀ فایل‌ها ابتدا در مسیر موقت ساخته و اعتبارسنجی می‌شوند و تنها پس از موفقیت کامل جایگزین می‌گردند؛ اجرای ناموفق درخت قبلی را بایت‌به‌بایت دست‌نخورده نگه می‌دارد. کد خروج: `0` موفق، `1` خطای دریافت/parse/یکپارچگی، `2` خطای استفاده/پیکربندی.
 
 ### استقرار با GitHub Actions
 
-منبع گردش‌کار در [`ci/update-subscriptions.yml`](ci/update-subscriptions.yml) نگهداری می‌شود. برای فعال‌سازی اجرای زمان‌بندی‌شده، آن را به `.github/workflows/update-subscriptions.yml` کپی کنید (یا از طریق رابط وب GitHub اضافه کنید)؛ ابزارهای خودکاری که مجوز `workflows` ندارند نمی‌توانند مستقیماً فایل زیر `.github/workflows/` را منتشر کنند. گردش‌کار به این صورت پیکربندی شده است:
+منبع گردش‌کار در [`ci/update-subscriptions.yml`](ci/update-subscriptions.yml) نگهداری می‌شود. برای فعال‌سازی اجرای زمان‌بندی‌شده، آن را به `.github/workflows/update-subscriptions.yml` کپی کنید (یا از طریق رابط وب GitHub اضافه کنید)؛ ابزارهای خودکاری که مجوز `workflows` ندارند نمی‌توانند مستقیماً فایل زیر `.github/workflows/` را منتشر کنند. گردش‌کار:
 
-- طبق برنامه‌ای متعادل (برای نمونه هر شش ساعت) اجرا شود و `workflow_dispatch` برای اجرای دستی داشته باشد.
-- از `actions/checkout` استفاده کند، **Python 3.12** را نصب/آماده کند، فقط وابستگی‌های لازم و نسخه‌ثابت را نصب کند و در صورت خطا با کد غیرصفر متوقف شود.
-- فقط مجوزهای لازم را بگیرد. اگر خروجی را commit می‌کند، دسترسی نوشتن را به محتوای مخزن محدود کند و فقط هنگام تغییر خروجی commit کند.
-- پس از شکست دریافت یا parse، خروجی ناقص منتشر نکند و فید معتبر قبلی را حفظ کند.
-- محتوای اشتراک، اعتبارنامه و توکن را در log ننویسد. پیش از فعال‌سازی انتشار خودکار، diff خروجی را بررسی کنید.
+- هر شش ساعت و به‌صورت دستی با ورودی‌های اختیاری health/AI اجرا می‌شود.
+- از `actions/checkout` و `actions/setup-python` نسخه‌ثابت، Python 3.12 و بدون وابستگی پایتونی شخص ثالث استفاده می‌کند.
+- آزمون‌ها، تجمیع و اعتبارسنجی آفلاین را اجرا می‌کند، خروجی تأییدشده را artifact می‌کند و فقط هنگام تغییر `data/` commit می‌کند.
+- فقط `contents: write` می‌گیرد، log را بدون اعتبارنامه نگه می‌دارد و پس از خطا خروجی ناقص منتشر نمی‌کند.
 
 گردش‌کار زمان‌بندی‌شده از default branch مخزن اجرا می‌شود.
 

@@ -5,6 +5,15 @@ on:
     # Every six hours; scheduled workflows run from the default branch.
     - cron: "0 */6 * * *"
   workflow_dispatch:
+    inputs:
+      health_check:
+        description: "Run advisory TCP/TLS health probes"
+        type: boolean
+        default: false
+      ai_review:
+        description: "Ask the optional 9Router gateway for a sanitized review"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -16,7 +25,7 @@ concurrency:
 jobs:
   aggregate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -26,11 +35,37 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run aggregator tests
+      - name: Run tests
         run: python -m unittest discover -s tests -v
 
-      - name: Aggregate sources
-        run: python scripts/aggregate.py --config config/sources.json --output-dir data
+      - name: Aggregate and verify
+        env:
+          NINEROUTER_URL: ${{ secrets.NINEROUTER_URL }}
+          NINEROUTER_KEY: ${{ secrets.NINEROUTER_KEY }}
+          NINEROUTER_MODEL: ${{ vars.NINEROUTER_MODEL }}
+        run: |
+          args=(--config config/sources.json --output-dir data --retries 2)
+          if [ "${{ inputs.health_check }}" = "true" ]; then
+            args+=(--health-check --health-concurrency 24 --tcp-timeout 3)
+          fi
+          if [ "${{ inputs.ai_review }}" = "true" ]; then
+            args+=(--ai-review --telemetry telemetry/last-run.jsonl)
+          fi
+          python scripts/aggregate.py "${args[@]}"
+          python scripts/verify.py --data-dir data
+
+      - name: Upload verified feeds
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: subscription-feeds
+          path: |
+            data/manifest.json
+            data/SHA256SUMS
+            data/subscriptions/
+            data/snapshot/
+            data/health.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Publish generated feeds
         run: |

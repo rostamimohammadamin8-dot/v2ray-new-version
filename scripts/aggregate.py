@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Aggregate public subscription sources into v2rayN-compatible text feeds.
+"""Transactional multi-source proxy subscription aggregator.
 
-The pipeline is intentionally strict and transactional:
-
-* sources are fetched over HTTPS only, with bounded time and size limits;
-* payloads must be strict UTF-8 and decode either to newline-separated proxy
-  URIs or to a Base64 subscription containing such URIs;
-* every URI in a payload must be structurally valid, otherwise the whole run
-  fails so that a truncated/malformed feed can never replace working output;
-* feeds and the manifest are staged in temporary files and moved into place
-  only after the complete run succeeded;
-* a last-known-good copy of ``global.txt`` is kept for offline use.
-
-Only the Python standard library is required (Python 3.12 is the target).
+Pipeline: fetch (HTTPS only, bounded) -> strict parse/validate -> deduplicate ->
+label -> optional async TCP/TLS health probe -> checksummed staging -> verify ->
+atomic publish. Any failure exits non-zero without touching published state.
 """
 
 from __future__ import annotations
@@ -20,15 +11,12 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import concurrent.futures
 import json
 import logging
-import os
 import re
-import shutil
 import socket
 import sys
-import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +25,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from scripts import ai_ops, health, integrity, proxy_uri  # noqa: E402
+
 LOGGER = logging.getLogger("aggregate")
 
 DEFAULT_CONFIG_PATH = Path("config/sources.json")
@@ -44,45 +38,17 @@ DEFAULT_OUTPUT_DIR = Path("data")
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 DEFAULT_TCP_TIMEOUT = 3.0
+DEFAULT_RETRIES = 2
+MAX_NODES = 10000
 MANIFEST_VERSION = 1
 
 COUNTRIES: tuple[str, ...] = ("DE", "US", "NL", "TR", "FR", "UK", "CA")
 GLOBAL_LABEL = "GLOBAL"
 FEED_LABELS: tuple[str, ...] = (GLOBAL_LABEL, *COUNTRIES)
-
-SUPPORTED_SCHEMES = frozenset(
-    {
-        "vmess",
-        "vless",
-        "trojan",
-        "ss",
-        "socks",
-        "socks5",
-        "http",
-        "https",
-        "hysteria",
-        "hysteria2",
-        "hy2",
-        "tuic",
-        "wireguard",
-        "ssh",
-    }
-)
+SUPPORTED_SCHEMES = proxy_uri.SUPPORTED_SCHEMES  # backwards-compatible re-export
 
 _COMMENT_PREFIXES = ("#", "//", ";")
-_USER_AGENT = "v2ray-subscription-aggregator/1.0 (+https://github.com/)"
-
-
-class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse redirects that would leave HTTPS at any hop."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urllib.parse.urlsplit(newurl).scheme.lower() != "https":
-            raise urllib.error.URLError("refusing non-HTTPS redirect")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-_HTTPS_ONLY_OPENER = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
+_USER_AGENT = "v2ray-subscription-aggregator/2.0 (+https://github.com/)"
 
 
 class AggregationError(Exception):
@@ -91,6 +57,16 @@ class AggregationError(Exception):
 
 class SourceError(AggregationError):
     """Raised when an individual subscription source is unusable."""
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() != "https":
+            raise urllib.error.URLError("refusing non-HTTPS redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTPS_ONLY_OPENER = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
 
 
 @dataclass(frozen=True)
@@ -102,61 +78,32 @@ class CountryHints:
     flag: str
 
 
-# Heuristic hints only. Remarks win over hostname hints, and an ambiguous result
-# falls back to GLOBAL. This is not geolocation.
+# Heuristic hints only. Remarks win over hostname hints; ambiguity -> GLOBAL.
 COUNTRY_HINTS: dict[str, CountryHints] = {
-    "DE": CountryHints(
-        names=("germany", "deutschland"),
-        codes=("de",),
-        cities=("frankfurt", "berlin", "munich", "nuremberg", "dusseldorf", "hamburg"),
-        tlds=("de",),
-        flag="\U0001F1E9\U0001F1EA",
-    ),
-    "US": CountryHints(
-        names=("united states", "united states of america", "america", "usa"),
-        codes=("us",),
-        cities=("new york", "los angeles", "seattle", "dallas", "miami", "chicago", "ashburn", "silicon valley"),
-        tlds=("us",),
-        flag="\U0001F1FA\U0001F1F8",
-    ),
-    "NL": CountryHints(
-        names=("netherlands", "the netherlands", "holland"),
-        codes=("nl",),
-        cities=("amsterdam", "rotterdam", "the hague", "eindhoven"),
-        tlds=("nl",),
-        flag="\U0001F1F3\U0001F1F1",
-    ),
-    "TR": CountryHints(
-        names=("turkey", "turkiye", "t\u00fcrkiye"),
-        codes=("tr",),
-        cities=("istanbul", "ankara", "izmir", "bursa"),
-        tlds=("tr",),
-        flag="\U0001F1F9\U0001F1F7",
-    ),
-    "FR": CountryHints(
-        names=("france",),
-        codes=("fr",),
-        cities=("paris", "marseille", "lyon", "toulouse"),
-        tlds=("fr",),
-        flag="\U0001F1EB\U0001F1F7",
-    ),
-    "UK": CountryHints(
-        names=("united kingdom", "great britain", "britain", "england", "scotland", "wales"),
-        codes=("uk", "gb"),
-        cities=("london", "manchester", "birmingham", "edinburgh", "glasgow"),
-        tlds=("uk",),
-        flag="\U0001F1EC\U0001F1E7",
-    ),
-    "CA": CountryHints(
-        names=("canada",),
-        codes=("ca",),
-        cities=("toronto", "montreal", "vancouver", "calgary", "ottawa"),
-        tlds=("ca",),
-        flag="\U0001F1E8\U0001F1E6",
-    ),
+    "DE": CountryHints(("germany", "deutschland"), ("de",), ("frankfurt", "berlin", "munich", "nuremberg", "dusseldorf", "hamburg"), ("de",), "\U0001F1E9\U0001F1EA"),
+    "US": CountryHints(("united states", "united states of america", "america", "usa"), ("us",), ("new york", "los angeles", "seattle", "dallas", "miami", "chicago", "ashburn", "silicon valley"), ("us",), "\U0001F1FA\U0001F1F8"),
+    "NL": CountryHints(("netherlands", "the netherlands", "holland"), ("nl",), ("amsterdam", "rotterdam", "the hague", "eindhoven"), ("nl",), "\U0001F1F3\U0001F1F1"),
+    "TR": CountryHints(("turkey", "turkiye", "t\u00fcrkiye"), ("tr",), ("istanbul", "ankara", "izmir", "bursa"), ("tr",), "\U0001F1F9\U0001F1F7"),
+    "FR": CountryHints(("france",), ("fr",), ("paris", "marseille", "lyon", "toulouse"), ("fr",), "\U0001F1EB\U0001F1F7"),
+    "UK": CountryHints(("united kingdom", "great britain", "britain", "england", "scotland", "wales"), ("uk", "gb"), ("london", "manchester", "birmingham", "edinburgh", "glasgow"), ("uk",), "\U0001F1EC\U0001F1E7"),
+    "CA": CountryHints(("canada",), ("ca",), ("toronto", "montreal", "vancouver", "calgary", "ottawa"), ("ca",), "\U0001F1E8\U0001F1E6"),
 }
 
 _HOST_LABEL_RE = re.compile(r"[a-z0-9-]+")
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(keyword.lower())}(?![a-z])", re.IGNORECASE)
+
+
+_COMPILED_HINTS: dict[str, tuple[tuple[re.Pattern[str], int], ...]] = {}
+for _country, _hints in COUNTRY_HINTS.items():
+    _patterns: list[tuple[re.Pattern[str], int]] = []
+    _patterns.extend((_keyword_pattern(name), 5) for name in _hints.names)
+    _patterns.extend((_keyword_pattern(city), 2) for city in _hints.cities)
+    _patterns.extend((_keyword_pattern(code), 3) for code in _hints.codes)
+    _COMPILED_HINTS[_country] = tuple(_patterns)
+
 
 @dataclass
 class SourceSpec:
@@ -169,15 +116,22 @@ class SourceResult:
     id: str
     node_count: int
     fetched_bytes: int
+    attempts: int = 1
 
 
 @dataclass
 class AggregationResult:
     nodes: list[str]
     labels: dict[str, str]
+    confidences: dict[str, int] = field(default_factory=dict)
+    label_sources: dict[str, str] = field(default_factory=dict)
     source_results: list[SourceResult] = field(default_factory=list)
     tcp_checked: int = 0
     tcp_reachable: int = 0
+    health_summary: dict | None = None
+    probes: list = field(default_factory=list)
+    probe_settings: health.ProbeSettings | None = None
+    warnings: dict[str, int] = field(default_factory=dict)
 
 
 def _normalize_text(raw: bytes, context: str) -> str:
@@ -185,7 +139,6 @@ def _normalize_text(raw: bytes, context: str) -> str:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise SourceError(f"{context}: payload is not valid UTF-8") from exc
-
     if text.startswith("\ufeff"):
         text = text[1:]
     return text.replace("\r\n", "\n").replace("\r", "\n")
@@ -196,12 +149,11 @@ def _is_comment(line: str) -> bool:
 
 
 def _b64decode(value: str) -> bytes:
-    candidate = re.sub(r"\s+", "", value)
+    candidate = re.sub(r"\s+", "", value or "")
     if not candidate:
         raise ValueError("empty base64 value")
     candidate = candidate.replace("-", "+").replace("_", "/")
-    padding = (-len(candidate)) % 4
-    candidate += "=" * padding
+    candidate += "=" * ((-len(candidate)) % 4)
     return base64.b64decode(candidate, validate=True)
 
 
@@ -216,107 +168,6 @@ def _looks_like_base64(text: str) -> bool:
     return True
 
 
-def _parse_vmess_json(uri: str) -> dict:
-    payload = uri[len("vmess://") :].split("#", 1)[0].strip()
-    try:
-        decoded = _b64decode(payload)
-        data = json.loads(decoded.decode("utf-8", errors="strict"))
-    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid vmess payload") from exc
-    if not isinstance(data, dict):
-        raise ValueError("invalid vmess payload")
-    host = data.get("add")
-    port = data.get("port")
-    if not isinstance(host, str) or not host.strip():
-        raise ValueError("vmess payload has no address")
-    try:
-        port_number = int(str(port).strip())
-    except (TypeError, ValueError) as exc:
-        raise ValueError("vmess payload has an invalid port") from exc
-    if not 1 <= port_number <= 65535:
-        raise ValueError("vmess payload has an invalid port")
-    return data
-
-
-def _split_host_port(hostport: str) -> tuple[str, int]:
-    hostport = hostport.strip()
-    if not hostport:
-        raise ValueError("missing host")
-    parsed = urllib.parse.urlsplit(f"//{hostport}")
-    host = parsed.hostname
-    port = parsed.port
-    if not host or port is None:
-        raise ValueError("missing host or port")
-    if not 1 <= port <= 65535:
-        raise ValueError("invalid port")
-    return host, port
-
-
-def node_endpoint(uri: str) -> tuple[str, int] | None:
-    """Return ``(host, port)`` for a node URI, or ``None`` if it is unknown."""
-
-    scheme = uri.split("://", 1)[0].lower()
-    try:
-        if scheme == "vmess":
-            data = _parse_vmess_json(uri)
-            return str(data["add"]).strip(), int(str(data["port"]).strip())
-        if scheme == "ss":
-            body = uri[len("ss://") :].split("#", 1)[0].split("?", 1)[0]
-            if "@" in body:
-                userinfo, hostport = body.rsplit("@", 1)
-                if not userinfo.strip():
-                    raise ValueError("ss payload has no credentials")
-                return _split_host_port(hostport)
-            decoded = _b64decode(body).decode("utf-8", errors="strict")
-            if "@" not in decoded:
-                raise ValueError("invalid ss payload")
-            userinfo, hostport = decoded.rsplit("@", 1)
-            if not userinfo.strip() or ":" not in userinfo:
-                raise ValueError("invalid ss credentials")
-            return _split_host_port(hostport)
-        parsed = urllib.parse.urlsplit(uri)
-        host = parsed.hostname
-        port = parsed.port
-        if host and port is not None:
-            return host, port
-    except (ValueError, binascii.Error, UnicodeDecodeError, KeyError):
-        return None
-    return None
-
-
-def validate_node_uri(uri: str) -> None:
-    if not uri or any(char.isspace() for char in uri):
-        raise ValueError("URI contains whitespace")
-    if "://" not in uri:
-        raise ValueError("URI has no scheme")
-    scheme = uri.split("://", 1)[0].lower()
-    if scheme not in SUPPORTED_SCHEMES:
-        raise ValueError(f"unsupported scheme: {scheme}")
-    if scheme == "vmess":
-        _parse_vmess_json(uri)
-        return
-    endpoint = node_endpoint(uri)
-    if endpoint is None:
-        raise ValueError(f"invalid {scheme} URI")
-    host, port = endpoint
-    if not host or not (1 <= port <= 65535):
-        raise ValueError(f"invalid {scheme} endpoint")
-
-
-def node_name(uri: str) -> str:
-    scheme = uri.split("://", 1)[0].lower()
-    if scheme == "vmess":
-        try:
-            name = _parse_vmess_json(uri).get("ps", "")
-        except ValueError:
-            return ""
-        return str(name).strip() if name is not None else ""
-    fragment = urllib.parse.urlsplit(uri).fragment
-    if not fragment:
-        return ""
-    return urllib.parse.unquote(fragment).strip()
-
-
 def _parse_uri_lines(text: str, context: str) -> list[str]:
     nodes: list[str] = []
     for line_number, raw_line in enumerate(text.split("\n"), start=1):
@@ -324,61 +175,54 @@ def _parse_uri_lines(text: str, context: str) -> list[str]:
         if not line or _is_comment(line):
             continue
         try:
-            validate_node_uri(line)
-        except ValueError as exc:
-            raise SourceError(f"{context}: invalid node on line {line_number} ({exc})") from exc
+            proxy_uri.parse_node(line)
+        except proxy_uri.NodeValidationError as exc:
+            raise SourceError(f"{context}: invalid node on line {line_number} ({exc.reason})") from exc
         nodes.append(line)
+        if len(nodes) > MAX_NODES:
+            raise SourceError(f"{context}: too many nodes")
     return nodes
 
 
 def parse_payload(raw: bytes, context: str = "source") -> list[str]:
-    """Decode a subscription payload into validated, de-duplicated node URIs."""
+    """Decode a payload into validated, de-duplicated node URIs."""
 
     text = _normalize_text(raw, context)
-
-    # A Base64 subscription is one opaque token (possibly line-wrapped), so it
-    # is detected before line-level URI validation. Plain URI lists always
-    # contain ``://`` and therefore cannot match this pattern.
     if _looks_like_base64(text):
         try:
-            decoded = _b64decode(text)
-            decoded_text = _normalize_text(decoded, f"{context} (base64)")
+            decoded_text = _normalize_text(_b64decode(text), f"{context} (base64)")
         except (SourceError, ValueError, binascii.Error) as exc:
             raise SourceError(f"{context}: invalid base64 subscription") from exc
         nodes = _parse_uri_lines(decoded_text, context)
-        if nodes:
-            return _dedupe(nodes)
-        raise SourceError(f"{context}: base64 subscription contains no nodes")
-
-    nodes = _parse_uri_lines(text, context)
-    if nodes:
-        return _dedupe(nodes)
-    raise SourceError(f"{context}: payload is neither a URI list nor a base64 subscription")
+        if not nodes:
+            raise SourceError(f"{context}: base64 subscription contains no nodes")
+    else:
+        nodes = _parse_uri_lines(text, context)
+        if not nodes:
+            raise SourceError(f"{context}: payload is neither a URI list nor a base64 subscription")
+    return _dedupe(nodes)
 
 
 def _dedupe(nodes: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for node in nodes:
-        if node in seen:
-            continue
-        seen.add(node)
-        unique.append(node)
+        if node not in seen:
+            seen.add(node)
+            unique.append(node)
     return unique
 
 
-def _keyword_pattern(keyword: str) -> re.Pattern[str]:
-    escaped = re.escape(keyword.lower())
-    return re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z])", re.IGNORECASE)
+def validate_node_uri(uri: str) -> None:
+    proxy_uri.parse_node(uri)
 
 
-_COMPILED_HINTS: dict[str, tuple[tuple[re.Pattern[str], int], ...]] = {}
-for _country, _hints in COUNTRY_HINTS.items():
-    _patterns: list[tuple[re.Pattern[str], int]] = []
-    _patterns.extend((_keyword_pattern(name), 5) for name in _hints.names)
-    _patterns.extend((_keyword_pattern(city), 2) for city in _hints.cities)
-    _patterns.extend((_keyword_pattern(code), 3) for code in _hints.codes)
-    _COMPILED_HINTS[_country] = tuple(_patterns)
+def node_endpoint(uri: str) -> tuple[str, int] | None:
+    return proxy_uri.node_endpoint(uri)
+
+
+def node_name(uri: str) -> str:
+    return proxy_uri.node_name(uri)
 
 
 def _score_text(text: str) -> dict[str, int]:
@@ -398,39 +242,42 @@ def _score_text(text: str) -> dict[str, int]:
     return scores
 
 
-def classify_country(uri: str, name: str | None = None) -> str:
-    """Best-effort country label; returns GLOBAL when ambiguous or unknown."""
+def classify_country_detail(uri: str, name: str | None = None) -> tuple[str, int, str]:
+    """Return (label, confidence 0-100, source) for a node."""
 
-    resolved_name = name if name is not None else node_name(uri)
-    scores = _score_text(resolved_name)
-
-    endpoint = node_endpoint(uri)
-    if endpoint:
-        host = endpoint[0].lower().rstrip(".")
-        labels = _HOST_LABEL_RE.findall(host)
+    parsed = proxy_uri.try_parse_node(uri)
+    resolved_name = name if name is not None else (parsed.name if parsed else proxy_uri.node_name(uri))
+    name_scores = _score_text(resolved_name)
+    scores = dict(name_scores)
+    source = "remark" if name_scores else "none"
+    if parsed is not None:
+        labels = _HOST_LABEL_RE.findall(parsed.host)
         for label in labels:
             for country, hints in COUNTRY_HINTS.items():
                 if label in hints.tlds:
                     scores[country] = scores.get(country, 0) + 2
-        # The last label is the TLD; the second-to-last label is usually the
-        # registrable domain and is only useful when it is a country token.
+                    source = "remark" if source == "remark" else "host"
         if len(labels) >= 2:
             for country, hints in COUNTRY_HINTS.items():
                 if labels[-2] in hints.codes:
                     scores[country] = scores.get(country, 0) + 1
-
+                    source = "remark" if source == "remark" else "host"
     if not scores:
-        return GLOBAL_LABEL
+        return GLOBAL_LABEL, 0, "none"
     best = max(scores.values())
     winners = [country for country, score in scores.items() if score == best]
     if len(winners) != 1:
-        return GLOBAL_LABEL
-    return winners[0]
+        return GLOBAL_LABEL, 0, source
+    total = sum(scores.values())
+    confidence = max(1, min(100, round(100 * best / total)))
+    return winners[0], confidence, source
+
+
+def classify_country(uri: str, name: str | None = None) -> str:
+    return classify_country_detail(uri, name)[0]
 
 
 def fetch_source(url: str, *, timeout: float, max_bytes: int) -> bytes:
-    """Fetch a source over HTTPS with bounded time and response size."""
-
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme.lower() != "https":
         raise SourceError("source URL must use HTTPS")
@@ -438,7 +285,6 @@ def fetch_source(url: str, *, timeout: float, max_bytes: int) -> bytes:
         raise SourceError("source URL has no host")
     if max_bytes <= 0:
         raise SourceError("max_bytes must be positive")
-
     request = urllib.request.Request(
         url,
         headers={"User-Agent": _USER_AGENT, "Accept": "text/plain, */*;q=0.5"},
@@ -446,8 +292,7 @@ def fetch_source(url: str, *, timeout: float, max_bytes: int) -> bytes:
     )
     try:
         with _HTTPS_ONLY_OPENER.open(request, timeout=timeout) as response:
-            final_url = response.geturl()
-            if urllib.parse.urlsplit(final_url).scheme.lower() != "https":
+            if urllib.parse.urlsplit(response.geturl()).scheme.lower() != "https":
                 raise SourceError("source redirected away from HTTPS")
             chunks: list[bytes] = []
             remaining = max_bytes + 1
@@ -460,9 +305,8 @@ def fetch_source(url: str, *, timeout: float, max_bytes: int) -> bytes:
             payload = b"".join(chunks)
     except SourceError:
         raise
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-        raise SourceError(f"failed to fetch source: {exc}") from exc
-
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise SourceError(f"failed to fetch source: {exc.__class__.__name__}") from exc
     if not payload:
         raise SourceError("source returned an empty payload")
     if len(payload) > max_bytes:
@@ -470,21 +314,32 @@ def fetch_source(url: str, *, timeout: float, max_bytes: int) -> bytes:
     return payload
 
 
+def _fetch_with_retries(fetch, url: str, *, timeout: float, max_bytes: int, retries: int) -> tuple[bytes, int]:
+    attempts = max(0, int(retries)) + 1
+    last: SourceError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch(url, timeout=timeout, max_bytes=max_bytes), attempt
+        except SourceError as exc:
+            last = exc
+            if attempt < attempts:
+                time.sleep(min(2.0, 0.25 * (2 ** (attempt - 1))))
+    assert last is not None
+    raise last
+
+
 def load_sources(config_path: Path) -> list[SourceSpec]:
     try:
-        raw = config_path.read_text(encoding="utf-8")
+        data = json.loads(config_path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise AggregationError(f"cannot read config {config_path}: {exc}") from exc
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AggregationError(f"config {config_path} is not valid JSON") from exc
     if not isinstance(data, dict) or data.get("version") != 1:
         raise AggregationError("config must be an object with version = 1")
     raw_sources = data.get("sources")
     if not isinstance(raw_sources, list):
         raise AggregationError("config.sources must be a list")
-
     specs: list[SourceSpec] = []
     seen_ids: set[str] = set()
     for index, entry in enumerate(raw_sources):
@@ -504,22 +359,38 @@ def load_sources(config_path: Path) -> list[SourceSpec]:
             raise AggregationError(f"source {source_id} must use HTTPS")
         seen_ids.add(source_id)
         specs.append(SourceSpec(id=source_id.strip(), url=source_url.strip()))
-
     if not specs:
         raise AggregationError("config has no enabled sources")
     return specs
 
 
 def _probe(node: str, timeout: float) -> bool:
-    endpoint = node_endpoint(node)
+    """Legacy single TCP probe retained for compatibility."""
+
+    endpoint = proxy_uri.node_endpoint(node)
     if endpoint is None:
         return False
-    host, port = endpoint
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection(endpoint, timeout=timeout):
             return True
     except OSError:
         return False
+
+
+def _label_nodes(nodes: Sequence[str]) -> tuple[dict[str, str], dict[str, int], dict[str, str], dict[str, int]]:
+    labels: dict[str, str] = {}
+    confidences: dict[str, int] = {}
+    sources: dict[str, str] = {}
+    warnings: dict[str, int] = {}
+    for node in nodes:
+        label, confidence, source = classify_country_detail(node)
+        labels[node] = label
+        confidences[node] = confidence
+        sources[node] = source
+        parsed = proxy_uri.parse_node(node)
+        for warning in parsed.warnings:
+            warnings[warning] = warnings.get(warning, 0) + 1
+    return labels, confidences, sources, warnings
 
 
 def aggregate(
@@ -530,17 +401,21 @@ def aggregate(
     tcp_check: bool = False,
     tcp_timeout: float = DEFAULT_TCP_TIMEOUT,
     require_reachable: bool = False,
+    retries: int = 0,
+    health_check: bool = False,
+    health_tls: bool = True,
+    health_concurrency: int = health.DEFAULT_CONCURRENCY,
+    verify_tls: bool = False,
     fetch=fetch_source,
 ) -> AggregationResult:
     all_nodes: list[str] = []
     seen: set[str] = set()
     source_results: list[SourceResult] = []
-
     for spec in specs:
-        payload = fetch(spec.url, timeout=timeout, max_bytes=max_bytes)
+        payload, attempts = _fetch_with_retries(
+            fetch, spec.url, timeout=timeout, max_bytes=max_bytes, retries=retries
+        )
         nodes = parse_payload(payload, context=f"source {spec.id}")
-        if not nodes:
-            raise SourceError(f"source {spec.id} contains no usable nodes")
         added = 0
         for node in nodes:
             if node in seen:
@@ -548,38 +423,54 @@ def aggregate(
             seen.add(node)
             all_nodes.append(node)
             added += 1
-        source_results.append(SourceResult(id=spec.id, node_count=added, fetched_bytes=len(payload)))
+        source_results.append(
+            SourceResult(id=spec.id, node_count=added, fetched_bytes=len(payload), attempts=attempts)
+        )
+        if len(all_nodes) > MAX_NODES:
+            raise AggregationError(f"node limit exceeded ({MAX_NODES})")
 
-    if not all_nodes:
-        raise AggregationError("no nodes were collected")
-
+    labels, confidences, label_sources, warnings = _label_nodes(all_nodes)
     tcp_checked = 0
     tcp_reachable = 0
-    if tcp_check:
-        tcp_checked = len(all_nodes)
-        reachable: dict[str, bool] = {}
-        workers = min(32, max(1, len(all_nodes)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            future_map = {pool.submit(_probe, node, tcp_timeout): node for node in all_nodes}
-            for future in concurrent.futures.as_completed(future_map):
-                node = future_map[future]
-                try:
-                    reachable[node] = bool(future.result())
-                except Exception:  # pragma: no cover - defensive
-                    reachable[node] = False
-        tcp_reachable = sum(1 for value in reachable.values() if value)
-        if require_reachable:
-            all_nodes = [node for node in all_nodes if reachable.get(node)]
-            if not all_nodes:
-                raise AggregationError("TCP check removed every node")
+    probes: list = []
+    probe_settings: health.ProbeSettings | None = None
+    health_summary: dict | None = None
 
-    labels = {node: classify_country(node) for node in all_nodes}
+    if health_check or tcp_check:
+        probe_settings = health.ProbeSettings(
+            timeout=tcp_timeout,
+            tls=health_tls if health_check else False,
+            concurrency=health_concurrency,
+            verify_tls=verify_tls,
+        ).normalized()
+        parsed_nodes = [proxy_uri.parse_node(node) for node in all_nodes]
+        probes = health.probe_nodes(
+            parsed_nodes,
+            labels=labels,
+            confidences=confidences,
+            settings=probe_settings,
+        )
+        health_summary = health.summarize(probes)
+        tcp_checked = health_summary["checked"]
+        tcp_reachable = health_summary["tcp_reachable"]
+        if require_reachable:
+            reachable = {item.node_id for item in probes if item.reachable}
+            all_nodes = [node for node in all_nodes if proxy_uri.fingerprint(node) in reachable]
+            if not all_nodes:
+                raise AggregationError("health check removed every node")
+
     return AggregationResult(
         nodes=all_nodes,
-        labels=labels,
+        labels={node: labels[node] for node in all_nodes},
+        confidences={node: confidences[node] for node in all_nodes},
+        label_sources={node: label_sources[node] for node in all_nodes},
         source_results=source_results,
         tcp_checked=tcp_checked,
         tcp_reachable=tcp_reachable,
+        health_summary=health_summary,
+        probes=probes,
+        probe_settings=probe_settings,
+        warnings=warnings,
     )
 
 
@@ -589,20 +480,26 @@ def _feed_files(result: AggregationResult) -> dict[str, str]:
         label = result.labels.get(node, GLOBAL_LABEL)
         if label in buckets:
             buckets[label].append(node)
-    files: dict[str, str] = {}
-    files[f"subscriptions/{GLOBAL_LABEL.lower()}.txt"] = "".join(
-        f"{line}\n" for line in result.nodes
-    )
+    files = {f"subscriptions/{GLOBAL_LABEL.lower()}.txt": "".join(f"{n}\n" for n in result.nodes)}
     for label in COUNTRIES:
-        files[f"subscriptions/{label.lower()}.txt"] = "".join(
-            f"{line}\n" for line in buckets[label]
-        )
+        files[f"subscriptions/{label.lower()}.txt"] = "".join(f"{n}\n" for n in buckets[label])
     return files
 
 
-def _write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+def _label_confidence(result: AggregationResult) -> dict:
+    values = [
+        confidence
+        for node, confidence in result.confidences.items()
+        if result.labels.get(node) != GLOBAL_LABEL
+    ]
+    sources: dict[str, int] = {}
+    for source in result.label_sources.values():
+        sources[source] = sources.get(source, 0) + 1
+    return {
+        "average": round(sum(values) / len(values), 1) if values else 0,
+        "classified": len(values),
+        "sources": dict(sorted(sources.items())),
+    }
 
 
 def write_outputs(
@@ -611,8 +508,8 @@ def write_outputs(
     output_dir: Path,
     source_count: int,
     generated_at: str | None = None,
+    publish_health: bool = False,
 ) -> dict:
-    output_dir = output_dir.resolve()
     feeds = _feed_files(result)
     counts = {label: 0 for label in FEED_LABELS}
     for node in result.nodes:
@@ -621,10 +518,21 @@ def write_outputs(
         if label != GLOBAL_LABEL:
             counts[label] = counts.get(label, 0) + 1
 
+    checksums = {relative: integrity.sha256_bytes(text.encode("utf-8")) for relative, text in feeds.items()}
+    checksums["snapshot/global.txt"] = checksums[f"subscriptions/{GLOBAL_LABEL.lower()}.txt"]
+
+    health_document = None
+    if publish_health and result.probes and result.probe_settings is not None:
+        health_document = health.build_document(
+            result.probes, result.probe_settings, generated_at=generated_at
+        )
+        checksums["health.json"] = integrity.sha256_bytes(
+            (json.dumps(health_document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
+
     manifest = {
         "version": MANIFEST_VERSION,
-        "generated_at_utc": generated_at
-        or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at_utc": generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source_count": source_count,
         "node_count": len(result.nodes),
         "feeds": {label: f"subscriptions/{label.lower()}.txt" for label in FEED_LABELS},
@@ -635,36 +543,65 @@ def write_outputs(
                 "id": item.id,
                 "node_count": item.node_count,
                 "fetched_bytes": item.fetched_bytes,
+                "attempts": item.attempts,
             }
             for item in result.source_results
         ],
+        "warnings": dict(sorted(result.warnings.items())),
+        "label_confidence": _label_confidence(result),
+        "checksums": dict(sorted(checksums.items())),
         "tcp_checked": result.tcp_checked,
         "tcp_reachable": result.tcp_reachable,
     }
-    manifest_text = json.dumps(manifest, indent=2, sort_keys=False, ensure_ascii=False) + "\n"
+    if publish_health and result.health_summary is not None:
+        manifest["health"] = {**result.health_summary, "published": len(result.nodes)}
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".aggregate-", dir=str(output_dir.parent)))
-    try:
-        staged: list[tuple[Path, Path]] = []
-        for relative, text in feeds.items():
-            source = staging / relative
-            _write_text(source, text)
-            staged.append((source, output_dir / relative))
-        snapshot_source = staging / "snapshot" / "global.txt"
-        _write_text(snapshot_source, feeds[f"subscriptions/{GLOBAL_LABEL.lower()}.txt"])
-        staged.append((snapshot_source, output_dir / "snapshot" / "global.txt"))
-        manifest_source = staging / "manifest.json"
-        _write_text(manifest_source, manifest_text)
-        staged.append((manifest_source, output_dir / "manifest.json"))
-
-        # Everything was staged successfully; publish feeds, snapshot, then manifest.
-        for source, destination in staged:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(source, destination)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+    manifest_text = json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    files: dict[str, str] = {relative: text for relative, text in feeds.items()}
+    files["snapshot/global.txt"] = feeds[f"subscriptions/{GLOBAL_LABEL.lower()}.txt"]
+    if health_document is not None:
+        files["health.json"] = json.dumps(health_document, indent=2, sort_keys=True) + "\n"
+    files["manifest.json"] = manifest_text
+    files[integrity.CHECKSUMS_NAME] = integrity.format_checksums(
+        {**checksums, "manifest.json": integrity.sha256_bytes(manifest_text.encode("utf-8"))}
+    )
+    integrity.publish_atomic(output_dir, files, verify=True)
+    if not publish_health:
+        stale = output_dir / "health.json"
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError as exc:
+            LOGGER.warning("could not remove stale health.json: %s", exc.__class__.__name__)
     return manifest
+
+
+def _append_telemetry(path: Path | None, event: str, **fields) -> None:
+    if path is None:
+        return
+    payload = ai_ops.sanitize(
+        {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "event": event, **fields}
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 2 * 1024 * 1024:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as exc:
+        LOGGER.warning("telemetry write failed: %s", exc.__class__.__name__)
+
+
+def _publish_ai_text(text: str | None, path: Path | None) -> None:
+    if not text:
+        return
+    if path is None:
+        LOGGER.info("AI review: %s", text[:1500])
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+    except OSError as exc:
+        LOGGER.warning("AI output write failed: %s", exc.__class__.__name__)
 
 
 def run(
@@ -676,25 +613,77 @@ def run(
     tcp_check: bool = False,
     tcp_timeout: float = DEFAULT_TCP_TIMEOUT,
     require_reachable: bool = False,
+    retries: int = DEFAULT_RETRIES,
+    health_check: bool = False,
+    health_tls: bool = True,
+    health_concurrency: int = health.DEFAULT_CONCURRENCY,
+    verify_tls: bool = False,
+    ai_config: ai_ops.GatewayConfig | None = None,
+    ai_review: bool = False,
+    ai_diagnose: bool = False,
+    ai_output: Path | None = None,
+    telemetry_path: Path | None = None,
     fetch=fetch_source,
 ) -> dict:
     specs = load_sources(config_path)
-    result = aggregate(
-        specs,
-        timeout=timeout,
-        max_bytes=max_bytes,
-        tcp_check=tcp_check,
-        tcp_timeout=tcp_timeout,
-        require_reachable=require_reachable,
-        fetch=fetch,
+    try:
+        result = aggregate(
+            specs,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            tcp_check=tcp_check,
+            tcp_timeout=tcp_timeout,
+            require_reachable=require_reachable,
+            retries=retries,
+            health_check=health_check,
+            health_tls=health_tls,
+            health_concurrency=health_concurrency,
+            verify_tls=verify_tls,
+            fetch=fetch,
+        )
+        manifest = write_outputs(
+            result, output_dir=output_dir, source_count=len(specs), publish_health=health_check
+        )
+        integrity.verify_or_raise(output_dir)
+    except Exception as exc:
+        if not isinstance(exc, AggregationError):
+            exc = AggregationError(f"integrity check failed: {exc}")
+        _append_telemetry(
+            telemetry_path,
+            "aggregation_failed",
+            error=str(exc),
+            sources=[spec.id for spec in specs],
+        )
+        if ai_diagnose:
+            try:
+                text = ai_ops.diagnose_failure(
+                    str(exc), {"sources": [spec.id for spec in specs]}, config=ai_config
+                )
+                _publish_ai_text(text, ai_output)
+            except ai_ops.GatewayError as gateway_exc:
+                LOGGER.warning("AI diagnosis unavailable: %s", gateway_exc)
+        raise exc
+
+    _append_telemetry(
+        telemetry_path,
+        "aggregation_succeeded",
+        node_count=manifest["node_count"],
+        source_count=manifest["source_count"],
+        counts=manifest["counts"],
+        health=manifest.get("health"),
+        warnings=manifest.get("warnings"),
     )
-    manifest = write_outputs(result, output_dir=output_dir, source_count=len(specs))
     LOGGER.info(
         "Published %d nodes from %d source(s) to %s",
         manifest["node_count"],
         manifest["source_count"],
         output_dir,
     )
+    if ai_review:
+        try:
+            _publish_ai_text(ai_ops.review_manifest(manifest, config=ai_config), ai_output)
+        except ai_ops.GatewayError as exc:
+            LOGGER.warning("AI review unavailable: %s", exc)
     return manifest
 
 
@@ -704,15 +693,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
-    parser.add_argument("--tcp-check", action="store_true", help="probe node endpoints")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="retries for transient source failures")
+    parser.add_argument("--tcp-check", action="store_true", help="advisory TCP-only probe")
+    parser.add_argument("--health-check", action="store_true", help="async TCP+TLS probe and health.json")
+    parser.add_argument("--no-tls-probe", action="store_true", help="skip TLS handshakes during health checks")
+    parser.add_argument("--verify-tls", action="store_true", help="verify certificates during TLS probes")
+    parser.add_argument("--health-concurrency", type=int, default=health.DEFAULT_CONCURRENCY)
     parser.add_argument("--tcp-timeout", type=float, default=DEFAULT_TCP_TIMEOUT)
-    parser.add_argument(
-        "--require-reachable",
-        action="store_true",
-        help="drop nodes whose TCP probe failed (implies --tcp-check)",
-    )
+    parser.add_argument("--require-reachable", action="store_true", help="drop nodes that fail the probe")
+    parser.add_argument("--ai-review", action="store_true", help="request a sanitized gateway review")
+    parser.add_argument("--ai-diagnose", action="store_true", help="request gateway diagnosis on failure")
+    parser.add_argument("--ai-model", default=None)
+    parser.add_argument("--ai-base-url", default=None)
+    parser.add_argument("--ai-output", type=Path, default=None)
+    parser.add_argument("--telemetry", type=Path, default=None)
     parser.add_argument("--verbose", action="store_true")
     return parser
+
+
+def _gateway_config(args: argparse.Namespace) -> ai_ops.GatewayConfig:
+    config = ai_ops.GatewayConfig.from_env(model=args.ai_model)
+    if args.ai_base_url:
+        config = ai_ops.GatewayConfig(
+            base_url=args.ai_base_url.rstrip("/"),
+            api_key=config.api_key,
+            model=config.model,
+            timeout=config.timeout,
+        )
+    return config
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -721,8 +729,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
-    if args.timeout <= 0 or args.max_bytes <= 0:
-        LOGGER.error("timeout and max-bytes must be positive")
+    if args.timeout <= 0 or args.max_bytes <= 0 or args.retries < 0:
+        LOGGER.error("timeout/max-bytes must be positive and retries >= 0")
         return 2
     try:
         run(
@@ -733,6 +741,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             tcp_check=args.tcp_check or args.require_reachable,
             tcp_timeout=args.tcp_timeout,
             require_reachable=args.require_reachable,
+            retries=args.retries,
+            health_check=args.health_check,
+            health_tls=not args.no_tls_probe,
+            health_concurrency=args.health_concurrency,
+            verify_tls=args.verify_tls,
+            ai_config=_gateway_config(args) if (args.ai_review or args.ai_diagnose) else None,
+            ai_review=args.ai_review,
+            ai_diagnose=args.ai_diagnose,
+            ai_output=args.ai_output,
+            telemetry_path=args.telemetry,
         )
     except AggregationError as exc:
         LOGGER.error("aggregation failed: %s", exc)
