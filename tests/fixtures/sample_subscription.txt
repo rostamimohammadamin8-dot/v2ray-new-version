@@ -1,0 +1,4 @@
+# Test fixture only. These endpoints are intentionally reserved/non-routable.
+vless://00000000-0000-0000-0000-000000000000@de.example.invalid:443#DE%20Fixture
+trojan://fixture@uk.example.invalid:443#UK%20Fixture
+hysteria2://fixture@nl.example.invalid:8443#NL%20Fixture
