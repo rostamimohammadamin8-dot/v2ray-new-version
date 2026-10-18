@@ -73,6 +73,18 @@ _COMMENT_PREFIXES = ("#", "//", ";")
 _USER_AGENT = "v2ray-subscription-aggregator/1.0 (+https://github.com/)"
 
 
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects that would leave HTTPS at any hop."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() != "https":
+            raise urllib.error.URLError("refusing non-HTTPS redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTPS_ONLY_OPENER = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
+
+
 class AggregationError(Exception):
     """Raised when a run must stop without publishing new output."""
 
@@ -251,12 +263,16 @@ def node_endpoint(uri: str) -> tuple[str, int] | None:
         if scheme == "ss":
             body = uri[len("ss://") :].split("#", 1)[0].split("?", 1)[0]
             if "@" in body:
-                _userinfo, hostport = body.rsplit("@", 1)
+                userinfo, hostport = body.rsplit("@", 1)
+                if not userinfo.strip():
+                    raise ValueError("ss payload has no credentials")
                 return _split_host_port(hostport)
             decoded = _b64decode(body).decode("utf-8", errors="strict")
             if "@" not in decoded:
                 raise ValueError("invalid ss payload")
-            _userinfo, hostport = decoded.rsplit("@", 1)
+            userinfo, hostport = decoded.rsplit("@", 1)
+            if not userinfo.strip() or ":" not in userinfo:
+                raise ValueError("invalid ss credentials")
             return _split_host_port(hostport)
         parsed = urllib.parse.urlsplit(uri)
         host = parsed.hostname
@@ -429,7 +445,7 @@ def fetch_source(url: str, *, timeout: float, max_bytes: int) -> bytes:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _HTTPS_ONLY_OPENER.open(request, timeout=timeout) as response:
             final_url = response.geturl()
             if urllib.parse.urlsplit(final_url).scheme.lower() != "https":
                 raise SourceError("source redirected away from HTTPS")

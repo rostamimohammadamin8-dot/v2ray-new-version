@@ -138,6 +138,15 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             agg.validate_node_uri("vmess://not-base64!")
 
+    def test_ss_without_credentials_is_rejected(self):
+        with self.assertRaises(ValueError):
+            agg.validate_node_uri("ss://@1.2.3.4:8388#empty")
+
+    def test_https_redirect_handler_rejects_downgrade(self):
+        handler = agg._HttpsOnlyRedirectHandler()
+        with self.assertRaises(agg.urllib.error.URLError):
+            handler.redirect_request(None, None, 302, "Found", {}, "http://example.com/sub")
+
 
 class FakeResponse:
     def __init__(self, payload: bytes, url: str = "https://example.com/sub"):
@@ -164,18 +173,18 @@ class FetchTests(unittest.TestCase):
 
     def test_size_limit_is_enforced(self):
         payload = b"a" * 2048
-        with mock.patch.object(agg.urllib.request, "urlopen", return_value=FakeResponse(payload)):
+        with mock.patch.object(agg._HTTPS_ONLY_OPENER, "open", return_value=FakeResponse(payload)):
             with self.assertRaises(agg.SourceError):
                 agg.fetch_source("https://example.com/sub", timeout=1, max_bytes=1024)
 
     def test_empty_payload_is_rejected(self):
-        with mock.patch.object(agg.urllib.request, "urlopen", return_value=FakeResponse(b"")):
+        with mock.patch.object(agg._HTTPS_ONLY_OPENER, "open", return_value=FakeResponse(b"")):
             with self.assertRaises(agg.SourceError):
                 agg.fetch_source("https://example.com/sub", timeout=1, max_bytes=1024)
 
     def test_payload_at_limit_is_accepted(self):
         payload = b"a" * 1024
-        with mock.patch.object(agg.urllib.request, "urlopen", return_value=FakeResponse(payload)):
+        with mock.patch.object(agg._HTTPS_ONLY_OPENER, "open", return_value=FakeResponse(payload)):
             self.assertEqual(
                 agg.fetch_source("https://example.com/sub", timeout=1, max_bytes=1024), payload
             )

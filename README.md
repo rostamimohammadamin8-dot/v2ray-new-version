@@ -137,7 +137,11 @@ feeds and snapshot untouched. The process exits non-zero on any failure.
 
 ### GitHub Actions deployment
 
-Add a workflow at `.github/workflows/update-subscriptions.yml` after implementing `scripts/aggregate.py`. Configure it to:
+The workflow source is kept at [`ci/update-subscriptions.yml`](ci/update-subscriptions.yml).
+Copy it to `.github/workflows/update-subscriptions.yml` (or add it through the
+GitHub web UI) to enable scheduled runs; automation integrations that lack the
+`workflows` permission cannot publish files under `.github/workflows/` directly.
+It is configured to:
 
 - Run on a modest schedule (for example, every six hours) and support `workflow_dispatch` for manual runs.
 - Use `actions/checkout`, set up **Python 3.12**, install only pinned/required dependencies, and run the aggregator with a non-zero exit code on failure.
@@ -351,7 +355,7 @@ python3 scripts/aggregate.py --config config/sources.json --output-dir data
 
 ### استقرار با GitHub Actions
 
-گردش‌کار در `.github/workflows/update-subscriptions.yml` پیاده‌سازی شده و به این صورت پیکربندی شده است:
+منبع گردش‌کار در [`ci/update-subscriptions.yml`](ci/update-subscriptions.yml) نگهداری می‌شود. برای فعال‌سازی اجرای زمان‌بندی‌شده، آن را به `.github/workflows/update-subscriptions.yml` کپی کنید (یا از طریق رابط وب GitHub اضافه کنید)؛ ابزارهای خودکاری که مجوز `workflows` ندارند نمی‌توانند مستقیماً فایل زیر `.github/workflows/` را منتشر کنند. گردش‌کار به این صورت پیکربندی شده است:
 
 - طبق برنامه‌ای متعادل (برای نمونه هر شش ساعت) اجرا شود و `workflow_dispatch` برای اجرای دستی داشته باشد.
 - از `actions/checkout` استفاده کند، **Python 3.12** را نصب/آماده کند، فقط وابستگی‌های لازم و نسخه‌ثابت را نصب کند و در صورت خطا با کد غیرصفر متوقف شود.
