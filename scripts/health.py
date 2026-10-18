@@ -173,9 +173,9 @@ async def probe_node(
     try:
         latency = await tcp_connector(node.host, node.port, settings.timeout)
         tcp_ok = True
-    except BaseException as exc:  # noqa: BLE001 - telemetry boundary
-        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-            raise
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise
+    except Exception as exc:  # noqa: BLE001 - telemetry boundary
         error = _error_kind(exc)
 
     if tcp_ok and settings.tls and tls_required:
@@ -185,9 +185,9 @@ async def probe_node(
             )
             tls_ok = True
             latency = max(latency or 0.0, tls_latency)
-        except BaseException as exc:  # noqa: BLE001 - telemetry boundary
-            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                raise
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception as exc:  # noqa: BLE001 - telemetry boundary
             error = _error_kind(exc)
 
     return ProbeResult(
