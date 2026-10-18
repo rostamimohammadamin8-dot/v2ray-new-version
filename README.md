@@ -4,9 +4,9 @@
 
 این مخزن، راهنمای استقرار یک تجمیع‌کننده چندمنبعی اشتراک و کلاینت قابل‌حمل v2rayN است.
 
-> **Repository status / وضعیت مخزن:** This checkout currently contains documentation only. The Python aggregator, generated feeds, GitHub Actions workflow, and v2rayN application source/build output described below are **not included or implemented in this repository**. Treat paths and examples as the target deployment design, not as existing, runnable files.
+> **Repository status / وضعیت مخزن:** The documented aggregation pipeline is implemented in this repository: `scripts/aggregate.py`, `config/sources.json`, the GitHub Actions workflow, and a stdlib test suite are present. The configured upstream source currently returns HTTP 404, so no generated feeds are committed yet; a failed run never replaces existing output. The v2rayN application source/build output is **not** included here.
 >
-> **وضعیت مخزن:** در حال حاضر این مخزن فقط شامل مستندات است. اسکریپت تجمیع پایتون، فیدهای تولیدشده، گردش‌کار GitHub Actions و کد/خروجی ساخت v2rayN که در ادامه شرح داده می‌شوند، **در این مخزن وجود ندارند و پیاده‌سازی نشده‌اند**. مسیرها و نمونه‌ها طرح استقرار پیشنهادی هستند، نه فایل‌های اجرایی موجود.
+> **وضعیت مخزن:** خط لوله تجمیع شرح‌داده‌شده در این مخزن پیاده‌سازی شده است: `scripts/aggregate.py`، `config/sources.json`، گردش‌کار GitHub Actions و مجموعه آزمون مبتنی بر کتابخانه استاندارد موجود هستند. منبع بالادستی پیکربندی‌شده در حال حاضر HTTP 404 برمی‌گرداند، بنابراین هنوز فید تولیدشده‌ای commit نشده است؛ اجرای ناموفق هرگز خروجی قبلی را جایگزین نمی‌کند. کد/خروجی ساخت v2rayN در این مخزن وجود ندارد.
 
 ## Contents
 
@@ -34,7 +34,7 @@ Only add other upstreams after reviewing and explicitly configuring them. Do not
 
 ### Target repository layout
 
-The following is a proposed layout; these files are not present in this documentation-only checkout.
+The aggregation files below are implemented; `data/` appears only after a successful run. The v2rayN application source/build output remains outside this repository.
 
 ```text
 .
@@ -116,6 +116,24 @@ https://raw.githubusercontent.com/<OWNER>/<REPOSITORY>/<BRANCH>/data/subscriptio
 ```
 
 Replace the placeholders with the repository and branch that actually host the generated feed. Do not use this template URL as-is.
+
+### Running the aggregator
+
+The implementation uses only the Python 3.12 standard library.
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 scripts/aggregate.py --config config/sources.json --output-dir data
+```
+
+Options: `--timeout` (per-request seconds, default 15), `--max-bytes` (per-source
+limit, default 5 MiB), `--tcp-check` (best-effort TCP probe), `--tcp-timeout`,
+`--require-reachable` (drop nodes that fail the probe), and `--verbose`.
+
+A successful run writes `data/subscriptions/*.txt`, `data/snapshot/global.txt`,
+and `data/manifest.json`. Files are staged first and published only after every
+enabled source was fetched and validated, so a failed run leaves the previous
+feeds and snapshot untouched. The process exits non-zero on any failure.
 
 ### GitHub Actions deployment
 
@@ -318,9 +336,22 @@ https://raw.githubusercontent.com/<OWNER>/<REPOSITORY>/<BRANCH>/data/subscriptio
 
 جای‌نگهدارها را با نام واقعی مخزن و branch میزبان فید عوض کنید؛ این URL نمونه را همان‌طور استفاده نکنید.
 
+### اجرای تجمیع‌کننده
+
+پیاده‌سازی فقط از کتابخانه استاندارد Python 3.12 استفاده می‌کند.
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 scripts/aggregate.py --config config/sources.json --output-dir data
+```
+
+گزینه‌ها: `--timeout` (ثانیه برای هر درخواست، پیش‌فرض ۱۵)، `--max-bytes` (سقف هر منبع، پیش‌فرض ۵ MiB)، `--tcp-check` (بررسی ابتدایی TCP)، `--tcp-timeout`، `--require-reachable` (حذف گره‌های ناموفق در بررسی TCP) و `--verbose`.
+
+اجرای موفق `data/subscriptions/*.txt`، `data/snapshot/global.txt` و `data/manifest.json` را می‌نویسد. ابتدا همه فایل‌ها در مسیر موقت ساخته می‌شوند و فقط پس از دریافت و اعتبارسنجی موفق همۀ منابع فعال، جایگزین خروجی نهایی می‌شوند؛ بنابراین اجرای ناموفق فیدها و snapshot قبلی را دست‌نخورده نگه می‌دارد و با کد غیرصفر خارج می‌شود.
+
 ### استقرار با GitHub Actions
 
-پس از پیاده‌سازی `scripts/aggregate.py`، گردش‌کار را در `.github/workflows/update-subscriptions.yml` اضافه کنید و آن را طوری پیکربندی کنید که:
+گردش‌کار در `.github/workflows/update-subscriptions.yml` پیاده‌سازی شده و به این صورت پیکربندی شده است:
 
 - طبق برنامه‌ای متعادل (برای نمونه هر شش ساعت) اجرا شود و `workflow_dispatch` برای اجرای دستی داشته باشد.
 - از `actions/checkout` استفاده کند، **Python 3.12** را نصب/آماده کند، فقط وابستگی‌های لازم و نسخه‌ثابت را نصب کند و در صورت خطا با کد غیرصفر متوقف شود.
@@ -328,7 +359,7 @@ https://raw.githubusercontent.com/<OWNER>/<REPOSITORY>/<BRANCH>/data/subscriptio
 - پس از شکست دریافت یا parse، خروجی ناقص منتشر نکند و فید معتبر قبلی را حفظ کند.
 - محتوای اشتراک، اعتبارنامه و توکن را در log ننویسد. پیش از فعال‌سازی انتشار خودکار، diff خروجی را بررسی کنید.
 
-گردش‌کار زمان‌بندی‌شده از default branch مخزن اجرا می‌شود. تا زمانی که پیاده‌سازی و workflow اضافه نشوند، job زمان‌بندی‌شده و فید منتشرشده‌ای وجود ندارد.
+گردش‌کار زمان‌بندی‌شده از default branch مخزن اجرا می‌شود.
 
 ### اتصال v2rayN و به‌روزرسانی
 

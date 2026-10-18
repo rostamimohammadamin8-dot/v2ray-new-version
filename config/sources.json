@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "free-vpn-config-pack-2026",
+      "url": "https://raw.githubusercontent.com/luke-wilsonio96i3/Free-VPN-Config-Pack-2026/main/sub_base64.txt",
+      "enabled": true
+    }
+  ]
+}
