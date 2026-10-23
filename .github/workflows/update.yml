@@ -1,0 +1,41 @@
+name: Update VPN Subscriptions
+
+on:
+  schedule:
+    # Run automatically every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Enable manual trigger from the Actions tab
+
+jobs:
+  update-subscription:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch and process VPN configurations
+        env:
+          VPN_SOURCE_URLS: ${{ secrets.VPN_SOURCE_URLS }}
+        run: |
+          echo "Processing subscription sources..."
+          if [ -f "index.js" ]; then
+            node index.js
+          elif [ -f "main.js" ]; then
+            node main.js
+          else
+            curl -sL $VPN_SOURCE_URLS > sub.txt
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git diff-index --quiet HEAD || git commit -m "Auto update VPN configurations [skip ci]"
+          git push
